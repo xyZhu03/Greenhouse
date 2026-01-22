@@ -25,7 +25,7 @@
 
 #define TAG "MUSHROOM_IOT"
 
-#define BOTON_PULSADO_ES 0 
+#define BOTON_PULSADO_ES 1 
 
 #define PIN_VENTILADOR     26   
 #define PIN_HUMIDIFICADOR  27
@@ -188,7 +188,8 @@ static void init_gpio(void) {
     gpio_config_t btn_conf = {
         .pin_bit_mask = (1ULL << PIN_BOTON),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = 1,
+        .pull_up_en = 0,
+        .pull_down_en = 1,
         .intr_type = GPIO_INTR_DISABLE
     };
     gpio_config(&btn_conf);
