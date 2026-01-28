@@ -12,6 +12,8 @@
 #include "nvs_flash.h"
 #include "nvs.h" 
 #include "esp_http_client.h"
+#include <esp_http_server.h>
+
 #include "mqtt_client.h"
 #include "esp_crt_bundle.h" 
 #include "esp_timer.h"
@@ -23,6 +25,12 @@
 #include "bme68x.h"
 #include "ssd1306.h"
 
+#include "esp_https_ota.h"
+#include "esp_ota_ops.h"
+
+
+
+
 #define TAG "MUSHROOM_IOT"
 
 #define BOTON_PULSADO_ES 1 
@@ -30,12 +38,17 @@
 #define PIN_VENTILADOR     26   
 #define PIN_HUMIDIFICADOR  27
 
-#define ESP_WIFI_SSID      " " //poner tu wifi
-#define ESP_WIFI_PASS      " " //poner tu contra de wifi
 #define TB_BROKER_URI      "mqtt://demo.thingsboard.io"
-#define TB_ACCESS_TOKEN    " " //token tb
-#define TELEGRAM_TOKEN     " " //tb telegram
-#define TELEGRAM_CHAT_ID   " " //chatid telegram       
+#define TB_ACCESS_TOKEN    "a08e1dncysa8fky6xive" 
+#define TELEGRAM_TOKEN     "8531142504:AAHamh-FsSlT65B9_0uMU9LtF4492xxAj3s" 
+#define TELEGRAM_CHAT_ID   "476420106"        
+
+#define OTA_URL "http://192.168.1.129:9000/invernaderoSBC.bin"
+
+
+
+#define APP_VERSION "v4.0.5" // pa test
+
 
 #define I2C_PORT            I2C_NUM_0
 #define PIN_SDA             21
@@ -46,6 +59,14 @@
 #define BME_ADDR_LOW        0x76
 #define BME_ADDR_HIGH       0x77
 #define OLED_ADDR           0x3C
+
+
+char current_ssid[32] = {0};
+char current_pass[64] = {0};
+
+void start_ap_mode(void);
+esp_err_t load_wifi_credentials(void);
+
 
 typedef struct {
     char nombre[16];
@@ -188,8 +209,8 @@ static void init_gpio(void) {
     gpio_config_t btn_conf = {
         .pin_bit_mask = (1ULL << PIN_BOTON),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = 0,
-        .pull_down_en = 1,
+        .pull_up_en = 0,      
+        .pull_down_en = 1,    
         .intr_type = GPIO_INTR_DISABLE
     };
     gpio_config(&btn_conf);
@@ -202,18 +223,116 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
 }
 
+esp_err_t save_wifi_credentials(const char *ssid, const char *pass) {
+    nvs_handle_t my_handle;
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &my_handle);
+    if (err == ESP_OK) {
+        nvs_set_str(my_handle, "w_ssid", ssid);
+        nvs_set_str(my_handle, "w_pass", pass);
+        nvs_commit(my_handle);
+        nvs_close(my_handle);
+        return ESP_OK;
+    }
+    return err;
+}
+
+esp_err_t load_wifi_credentials(void) {
+    nvs_handle_t my_handle;
+    size_t ssid_len = sizeof(current_ssid);
+    size_t pass_len = sizeof(current_pass);
+    esp_err_t err = nvs_open("storage", NVS_READONLY, &my_handle);
+    if (err == ESP_OK) {
+        if(nvs_get_str(my_handle, "w_ssid", current_ssid, &ssid_len) == ESP_OK &&
+           nvs_get_str(my_handle, "w_pass", current_pass, &pass_len) == ESP_OK) {
+            nvs_close(my_handle);
+            return ESP_OK;
+        }
+        nvs_close(my_handle);
+    }
+    return ESP_FAIL;
+}
+
+static esp_err_t save_post_handler(httpd_req_t *req) {
+    char buf[150];
+    int ret = httpd_req_recv(req, buf, req->content_len);
+    if (ret <= 0) return ESP_FAIL;
+    buf[ret] = '\0';
+
+    char ssid[32] = {0}, pass[64] = {0};
+    if (httpd_query_key_value(buf, "ssid", ssid, sizeof(ssid)) == ESP_OK &&
+        httpd_query_key_value(buf, "pwd", pass, sizeof(pass)) == ESP_OK) {
+        
+        save_wifi_credentials(ssid, pass);
+        httpd_resp_send(req, "<h1>Guardado! Reiniciando...</h1>", -1);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_restart(); 
+    }
+    return ESP_OK;
+}
+
+static esp_err_t config_get_handler(httpd_req_t *req) {
+    char html[1024] = "<html><body><h1>Configurar WiFi SBC</h1>"
+                      "<form action='/save' method='post'>"
+                      "SSID: <input type='text' name='ssid'><br>"
+                      "Pass: <input type='password' name='pwd'><br>"
+                      "<input type='submit' value='Guardar'></form></body></html>";
+    httpd_resp_send(req, html, -1);
+    return ESP_OK;
+}
+
+void start_ap_mode(void) {
+    ESP_LOGI(TAG, "Iniciando Modo Punto de Acceso (AP)");
+    
+    if(oled_detectada) {
+        ssd1306_clear_screen(&oled, false);
+        ssd1306_display_text(&oled, 0, "MODO CONFIG", 11, false);
+        ssd1306_display_text(&oled, 2, "WIFI: ESP32-SBC", 15, false);
+        ssd1306_display_text(&oled, 4, "IP: 192.168.4.1", 15, false);
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg); 
+
+    esp_netif_create_default_wifi_ap();
+    
+    wifi_config_t wifi_config = {
+        .ap = { .ssid = "ESP32-SBC-Config", .password = "", .max_connection = 4, .authmode = WIFI_AUTH_OPEN }
+    };
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t uri_get = { .uri = "/", .method = HTTP_GET, .handler = config_get_handler };
+        httpd_register_uri_handler(server, &uri_get);
+        httpd_uri_t uri_post = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler };
+        httpd_register_uri_handler(server, &uri_post);
+    }
+    
+    while(1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+}
+
 void wifi_init_sta(void) {
     s_wifi_event_group = xEventGroupCreate();
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
     esp_netif_create_default_wifi_sta();
+    
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
-    wifi_config_t wifi_config = { .sta = { .ssid = ESP_WIFI_SSID, .password = ESP_WIFI_PASS } };
+
+    wifi_config_t wifi_config = { .sta = { .threshold.authmode = WIFI_AUTH_WPA2_PSK } };
+    
+    strlcpy((char *)wifi_config.sta.ssid, current_ssid, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, current_pass, sizeof(wifi_config.sta.password));
+
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -235,8 +354,20 @@ static void mqtt_app_start(void) {
 void send_telemetry_thingsboard(float temp, float hum, float press, float gas) {
     if (!mqtt_connected) return;
     int fase_id = (fase_actual == &fase_germinacion) ? 0 : 1; 
+	
+	// MODO PRUEBA: FORZAR VALORES PERFECTOS o MALOOOOS
+    // Si estás en Germinación (24-28), enviamos 26.
+    // Si estás en Fructificación (18-23), enviamos 20.
+    //float temp_fake = (fase_id == 0) ? 26.0 : 20.0;
+    //float hum_fake = (fase_id == 0) ? 65.0 : 92.0;
+	
+	//float temp_fake = 50.0; // ¡Hoguera!
+    //float hum_fake = 10.0;  // Muy seco
+	
+    // ---------------------------------------------
+	
     char telemetry_json[256]; 
-    snprintf(telemetry_json, sizeof(telemetry_json), 
+    snprintf(telemetry_json, sizeof(telemetry_json), //cambiar si quieres temp y hum a temp_fake o hum_fake para simular thingsboard
         "{\"temperature\":%.2f,\"humidity\":%.2f,\"pressure\":%.2f,\"gas\":%.0f,\"auto\":%d,\"fan\":%d,\"humid\":%d,\"phase_id\":%d}", 
         temp, hum, press, gas, modo_automatico, gpio_get_level(PIN_VENTILADOR), gpio_get_level(PIN_HUMIDIFICADOR), fase_id);
     esp_mqtt_client_publish(mqtt_client, "v1/devices/me/telemetry", telemetry_json, 0, 1, 0);
@@ -256,6 +387,39 @@ void telegram_send_message_to(const char *chat_id, const char *text) {
     esp_http_client_perform(client);
     free(post_data);
     esp_http_client_cleanup(client);
+}
+
+void ota_task(void *pvParameter) {
+    ESP_LOGI(TAG, "Iniciando OTA desde: %s", OTA_URL);
+    
+    if (oled_detectada) {
+        ssd1306_clear_screen(&oled, false);
+        ssd1306_display_text(&oled, 0, "ACTUALIZANDO...", 13, false);
+    }
+
+    esp_http_client_config_t config = {
+        .url = OTA_URL,
+        .crt_bundle_attach = NULL, 
+        .keep_alive_enable = true,
+        .timeout_ms = 30000,    
+        .keep_alive_interval = 10, 
+    };
+
+    esp_https_ota_config_t ota_config = {
+        .http_config = &config,
+    };
+
+    esp_err_t ret = esp_https_ota(&ota_config);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "OTA Exitosa. Reiniciando...");
+        esp_restart();
+    } else {
+        ESP_LOGE(TAG, "Fallo OTA");
+        if (oled_detectada) {
+            ssd1306_display_text(&oled, 2, "Error OTA", 9, false);
+        }
+    }
+    vTaskDelete(NULL);
 }
 
 static void telegram_check_updates(void) {
@@ -357,6 +521,10 @@ static void telegram_check_updates(void) {
                                             guardar_cambios = true; 
                                             telegram_send_message_to(chat_id_str, "Humidificador OFF (Manual).");
                                         }
+										else if (strcmp(text->valuestring, "/actualizar") == 0) {
+											telegram_send_message_to(chat_id_str, "Descargando actualización...");
+											xTaskCreate(ota_task, "ota_task", 8192, NULL, 5, NULL);
+										}
                                         else {
                                             telegram_send_message_to(chat_id_str, "Comando desconocido.");
                                         }
@@ -401,29 +569,32 @@ void check_auto_control(float temp, float hum) {
     }
 }
 
+
+
 void app_main(void) {
-    nvs_flash_init(); 
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+	
     init_gpio();
+    init_i2c_bus();      
+    init_oled_device();  
 
-    if (gpio_get_level(PIN_BOTON) == 0) {
-        ESP_LOGW(TAG, "Botón detectado al inicio: Forzando Modo AUTO");
-        modo_automatico = true;
-        fase_actual = &fase_germinacion;
-        guardado_fan_state = 0;
-        guardado_hum_state = 0;
-        guardar_estado_nvs();
-    } else {
-        cargar_estado_nvs(); 
+    bool boton_pulsado = (gpio_get_level(PIN_BOTON) == BOTON_PULSADO_ES);
+    bool wifi_guardado = (load_wifi_credentials() == ESP_OK);
+
+    if (boton_pulsado || !wifi_guardado) {
+        ESP_LOGW(TAG, "Entrando en MODO CONFIGURACION (AP)");
+        start_ap_mode(); 
     }
 
-    if (!modo_automatico) {
-        gpio_set_level(PIN_VENTILADOR, guardado_fan_state);
-        gpio_set_level(PIN_HUMIDIFICADOR, guardado_hum_state);
-        ESP_LOGI(TAG, "Restaurando estado MANUAL -> Fan: %d, Hum: %d", guardado_fan_state, guardado_hum_state);
-    }
-
-    init_i2c_bus();
-    init_oled_device(); 
+    esp_ota_mark_app_valid_cancel_rollback(); 
+    cargar_estado_nvs(); 
 
     if (!init_bme_device()) {
         if(oled_detectada) ssd1306_display_text(&oled, 0, "Error Sensor", 12, false);
@@ -452,8 +623,8 @@ void app_main(void) {
         mqtt_app_start();
         
         char msg_inicio[128];
-        snprintf(msg_inicio, 128, "Sistema Online.\n%s | %s", 
-                 fase_actual->nombre, modo_automatico ? "AUTO" : "MANUAL");
+		snprintf(msg_inicio, 128, "Sistema Online %s.\n%s | %s", 
+			 APP_VERSION, fase_actual->nombre, modo_automatico ? "AUTO" : "MANUAL");
         telegram_send_message_to(TELEGRAM_CHAT_ID, msg_inicio);
         
         xTaskCreate(telegram_task, "telegram_task", 8192, NULL, 5, NULL);
