@@ -39,6 +39,7 @@ El bot acepta los siguientes comandos:
 - `/fructificacion`: Cambia el perfil a Fructificación y activa modo Auto.
 - `/auto`: Activa el control automático.
 - `/manual`: Pasa a control manual.
+- `/actualizar`: Actualizar el sistema vía OTA.
 - `/encender_ventilador` / `/apagar_ventilador`: Control manual del ventilador.
 - `/encender_humidificador` / `/apagar_humidificador`: Control manual del humidificador.
 
